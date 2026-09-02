@@ -10,7 +10,7 @@ using File = ACC.ApiClient.Entities.File;
 
 namespace ACC.ApiClient;
 
-public class ApiClient : IApiClient
+public partial class ApiClient : IApiClient
 {
     private string? _accessToken;
     private DateTime? _accessTokenExpiresAt;
@@ -756,7 +756,7 @@ public class ApiClient : IApiClient
             var values = new Dictionary<string, string>
             {
                 { "grant_type", "client_credentials" },
-                { "scope", "data:read" }
+                { "scope", Config.Scope }
             };
             var body = new FormUrlEncodedContent(values);
 

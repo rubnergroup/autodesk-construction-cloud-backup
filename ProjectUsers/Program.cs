@@ -1,0 +1,85 @@
+﻿using ACC.ApiClient;
+using ACC.ProjectUsers;
+using CommandLine;
+using Library.Logger;
+using Serilog;
+using Serilog.Events;
+using Serilog.Sinks.SystemConsole.Themes;
+using ILogger = Library.Logger.ILogger;
+
+var parsed = Parser.Default.ParseArguments<CommandLineArgs>(args);
+if (parsed.Errors.Any()) return 1;
+var options = parsed.Value;
+
+Log.Logger = new LoggerConfiguration()
+    .MinimumLevel.Is(options.DebugLogging ? LogEventLevel.Debug : LogEventLevel.Information)
+    .WriteTo.Console(
+        theme: AnsiConsoleTheme.Code,
+        outputTemplate: "[{Timestamp:HH:mm:ss} {Level:u3}] {Message:lj}{NewLine}{Exception}")
+    .CreateLogger();
+
+ILogger logger = new SerilogLogger(Log.Logger, new SerilogLoggerConfiguration
+{
+    LogLevel = options.DebugLogging ? LogLevel.Debug : LogLevel.Info,
+    LogToConsole = true,
+    LogToFile = false
+});
+
+var apiClient = TwoLeggedApiClient
+    .Configure()
+    .WithClientId(options.ClientId)
+    .AndClientSecret(options.ClientSecret)
+    .ForAccount(options.AccountId)
+    .WithOptions(o =>
+    {
+        o.Logger = logger;
+        o.HubId = options.HubId;
+        // The ACC Admin API needs account scopes on top of the data scope used for backups.
+        o.Scope = "data:read account:read account:write";
+    })
+    .Create();
+apiClient.AdminUserId = options.AdminUserId;
+
+var projects = await apiClient.GetProjects();
+if (options.NumberOfProjects > 0) projects = projects.Take(options.NumberOfProjects).ToList();
+
+var action = options.Remove ? "Removing" : "Adding";
+var direction = options.Remove ? "from" : "to";
+logger.Info($"=> {action} {options.UserEmail} {direction} {projects.Count} project(s){(options.DryRun ? " (dry run)" : "")}");
+
+var succeeded = 0;
+var failed = 0;
+foreach (var project in projects)
+    try
+    {
+        if (options.Remove)
+        {
+            var existing = await apiClient.GetProjectUserByEmail(project.ProjectId, options.UserEmail);
+            if (existing is null)
+            {
+                logger.Info($"[skip] {project.Name}: {options.UserEmail} is not a member");
+                continue;
+            }
+
+            if (!options.DryRun) await apiClient.RemoveProjectUser(project.ProjectId, existing.Id);
+            logger.Info($"[ok] {project.Name}: removed {options.UserEmail}");
+        }
+        else
+        {
+            if (!options.DryRun)
+                await apiClient.AddProjectUser(project.ProjectId, options.UserEmail, options.ProductKey,
+                    options.ProductAccess);
+            logger.Info($"[ok] {project.Name}: added {options.UserEmail}");
+        }
+
+        succeeded++;
+    }
+    catch (Exception ex)
+    {
+        failed++;
+        logger.Error(ex, $"[fail] {project.Name} ({project.ProjectId})");
+    }
+
+logger.Info($"=> Done. {succeeded} succeeded, {failed} failed.");
+Log.CloseAndFlush();
+return failed == 0 ? 0 : 1;

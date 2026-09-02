@@ -14,4 +14,8 @@ public class ApiClientOptions
     public ILogger? Logger { get; set; }
     public int RetryAttempts { get; set; } = 15; // Each retry attempt is RetryAttempt# * InitialRetryInSeconds
     public int InitialRetryInSeconds { get; set; } = 2; // RetryAttempts 15 with InitialRetryInSeconds 2 = 4 minutes
+
+    // OAuth scopes requested for the 2-legged token. The ACC Admin API (project user management)
+    // needs account:read account:write on top of the backup's data:read.
+    public string Scope { get; set; } = "data:read";
 }
