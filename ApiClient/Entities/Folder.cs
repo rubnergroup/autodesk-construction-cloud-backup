@@ -39,6 +39,14 @@ public class Folder
     public bool IsRootFolder => ParentFolderId.EndsWith("-g");
     public List<Folder> Subfolders { get; set; } = new();
     public List<File> Files { get; set; } = new();
+
+    /// <summary>
+    /// True when this folder's contents were deliberately not enumerated because its
+    /// LastModifiedTimeRollup matched the previous backup. Subfolders and Files are empty as a
+    /// result, so anything that treats an enumerated tree as the complete picture (manifest
+    /// generation, obsolete-file cleanup) must fold in the previous manifest for this subtree.
+    /// </summary>
+    public bool Pruned { get; set; }
     public bool IsEmpty => Subfolders.Count + Files.Count == 0;
     public bool IsNotEmpty => IsEmpty == false;
     public DirectoryInfo? DirectoryInfo { get; set; }

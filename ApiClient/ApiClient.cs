@@ -22,7 +22,13 @@ public class ApiClient : IApiClient
 
     // Incremental backup support
     private BackupManifest? _previousBackupManifest;
-    
+
+    // Rollup pruning support
+    private long _bytesSkipped;
+    private int _filesSkipped;
+    private int _foldersPruned;
+    private Dictionary<string, string> _projectPathPrefixes = new();
+
     // Thread-safe directory creation lock
     private static readonly object _directoryCreationLock = new object();
 
@@ -153,10 +159,97 @@ public class ApiClient : IApiClient
     {
         Config.Logger?.Trace("Top");
         await GetFolderContents(folder);
-        foreach (var folderFolder in folder.Subfolders) await GetFolderContentsRecursively(folderFolder);
+        foreach (var folderFolder in folder.Subfolders)
+        {
+            if (ShouldPruneSubfolder(folderFolder)) continue;
+            await GetFolderContentsRecursively(folderFolder);
+        }
 
         Config.Logger?.Debug($"Returning folder (id: {folder.FolderId}, name: {folder.Name}) with " +
                              $"{folder.Files.Count} files and {folder.Subfolders.Count} subfolders");
+    }
+
+    /// <summary>
+    /// Decides whether a subfolder's subtree can be skipped entirely because Autodesk reports the
+    /// same LastModifiedTimeRollup we recorded last run. Every failure mode returns false so the
+    /// walk falls back to a full enumeration -- pruning must never be the reason a file is missed.
+    /// Note that the rollup does not move on deletion, so a pruned subtree can still hold files that
+    /// have since been removed from ACC. That keeps extra files rather than losing them, and clears
+    /// the next time anything in the folder is added or edited.
+    /// </summary>
+    private bool ShouldPruneSubfolder(Folder folder)
+    {
+        if (!PruneUnchangedFolders) return false;
+        if (_previousBackupManifest is null) return false;
+        if (Config.DryRun) return false;
+
+        if (!_previousBackupManifest.TryGetFolder(folder.FolderId, out var previousEntry) || previousEntry is null)
+            return false;
+
+        if (previousEntry.LastModifiedTimeRollup != folder.LastModifiedTimeRollup)
+            return false;
+
+        // A folder or project rename moves files on disk without necessarily disturbing the rollup,
+        // so the recorded path has to still agree with where this folder now sits.
+        var manifestPath = GetManifestFolderPath(folder);
+        if (manifestPath is null ||
+            !string.Equals(manifestPath, previousEntry.Path, StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        // The rollup only tells us Autodesk's copy is unchanged. Confirm our copy is intact too,
+        // otherwise a file deleted or truncated on disk would never be noticed again.
+        if (!PreviousFilesIntactOnDisk(manifestPath, out var fileCount, out var byteCount))
+            return false;
+
+        folder.Pruned = true;
+        Interlocked.Increment(ref _foldersPruned);
+        Interlocked.Add(ref _filesSkipped, fileCount);
+        Interlocked.Add(ref _bytesSkipped, byteCount);
+        Config.Logger?.Debug(
+            $"[PRUNED] {manifestPath} unchanged (rollup {folder.LastModifiedTimeRollup:O}), " +
+            $"skipping {fileCount} file(s) and all nested folders");
+        return true;
+    }
+
+    /// <summary>
+    /// Verifies every file the previous manifest recorded under this folder is still present at the
+    /// expected size, so the subtree can be trusted without re-enumerating it. Purely local IO -- no
+    /// API calls, which is the entire point of pruning.
+    /// </summary>
+    private bool PreviousFilesIntactOnDisk(string manifestFolderPath, out int fileCount, out long byteCount)
+    {
+        fileCount = 0;
+        byteCount = 0;
+        var previousBackupDirectory = _previousBackupDirectory;
+        if (string.IsNullOrWhiteSpace(previousBackupDirectory)) return false;
+
+        foreach (var (key, entry) in _previousBackupManifest!.GetFilesUnder(manifestFolderPath))
+        {
+            var path = Path.Combine(previousBackupDirectory!, key.Replace('/', Path.DirectorySeparatorChar));
+            var info = new FileInfo(path);
+            if (!info.Exists || info.Length != entry.StorageSize)
+            {
+                Config.Logger?.Debug(
+                    $"Not pruning {manifestFolderPath}: {key} is missing or the wrong size on disk, re-enumerating.");
+                return false;
+            }
+
+            fileCount++;
+            byteCount += entry.StorageSize;
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Builds the manifest-relative path for a folder ("Sanitized Project/Project Files/Sub"), which
+    /// shares its prefix with the manifest's file keys. Returns null when the project prefix is
+    /// unknown, which disables pruning for that project.
+    /// </summary>
+    private string? GetManifestFolderPath(Folder folder)
+    {
+        if (!_projectPathPrefixes.TryGetValue(folder.ProjectId, out var projectPrefix)) return null;
+        return $"{projectPrefix}/{folder.GetPath()[1..]}".Replace('\\', '/');
     }
 
     public async Task GetFolderContents(Folder folder)
@@ -205,9 +298,17 @@ public class ApiClient : IApiClient
         Config.Logger?.Trace($"Returning with {folder.Files.Count} files and {folder.Subfolders.Count} folders");
     }
 
+    /// <summary>
+    /// When enabled, GetFolderContentsRecursively skips subtrees whose LastModifiedTimeRollup is
+    /// unchanged since the previous backup. Requires a previous manifest that carries folder
+    /// rollups and project path prefixes; without either, enumeration stays exhaustive.
+    /// </summary>
+    public bool PruneUnchangedFolders { get; set; }
+
     public void SetPreviousBackupManifest(BackupManifest manifest)
     {
         _previousBackupManifest = manifest;
+        manifest?.BuildFolderIndex();
 
         if (manifest != null && !string.IsNullOrWhiteSpace(manifest.BackupDirectory))
         {
@@ -219,9 +320,20 @@ public class ApiClient : IApiClient
         }
     }
 
-    public (int downloaded, int copied, long bytesDownloaded, long bytesCopied) GetIncrementalStats()
+    /// <summary>
+    /// Supplies the sanitized directory name each project is backed up under, so folder paths can be
+    /// matched against manifest keys. Must be set before enumeration for pruning to engage.
+    /// </summary>
+    public void SetProjectPathPrefixes(IDictionary<string, string> prefixesByProjectId)
     {
-        return (_filesDownloaded, _filesCopied, _bytesDownloaded, _bytesCopied);
+        _projectPathPrefixes = new Dictionary<string, string>(prefixesByProjectId, StringComparer.Ordinal);
+    }
+
+    public (int downloaded, int copied, long bytesDownloaded, long bytesCopied, int filesSkipped, long bytesSkipped,
+        int foldersPruned) GetIncrementalStats()
+    {
+        return (_filesDownloaded, _filesCopied, _bytesDownloaded, _bytesCopied, _filesSkipped, _bytesSkipped,
+            _foldersPruned);
     }
 
     /// <summary>

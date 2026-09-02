@@ -22,6 +22,8 @@ public class Backup : IBackup
     private TimeSpan _totalDownloadTime = TimeSpan.Zero;
     private int _projectsProcessed = 0;
     private BackupManifest? _previousBackupManifest;
+    private readonly Dictionary<string, string> _projectPathPrefixes = new();
+    private Dictionary<string, (int files, long bytes)> _prunedTotalsByProjectId = new();
 
     public Backup(BackupConfiguration config, ILogger logger)
     {
@@ -78,6 +80,12 @@ public class Backup : IBackup
         _previousBackupManifest = LoadPreviousBackupManifest();
         if (_previousBackupManifest != null) ApiClient.SetPreviousBackupManifest(_previousBackupManifest);
 
+        // Map each project to the directory it is backed up under, so the ApiClient can line folder
+        // paths up with manifest keys when deciding what to prune.
+        foreach (var project in _projects) _projectPathPrefixes[project.ProjectId] = SanitizeProjectName(project.Name);
+        ApiClient.SetProjectPathPrefixes(_projectPathPrefixes);
+        ConfigureRollupPruning();
+
         LogProjectsSelectedForBackup(_projects);
 
         // Create a channel for the producer-consumer pipeline
@@ -92,7 +100,7 @@ public class Backup : IBackup
         {
             var semaphore = new SemaphoreSlim(3, 3); // Allow up to 3 concurrent enumerations
             var enumerationTasks = new List<Task>();
-            
+
             foreach (var project in _projects)
             {
                 var projectTask = Task.Run(async () =>
@@ -110,6 +118,8 @@ public class Backup : IBackup
                     catch (Exception ex)
                     {
                         Logger.Error(ex, $"Failed to enumerate project {project.Name} ({project.ProjectId})");
+                        // The tree is incomplete, so it must not drive manifest generation or cleanup
+                        project.EnumerationFailed = true;
                         // Still mark as started/finished for summary reporting
                         if (project.BackupStartedAt == null)
                             project.BackupStartedAt = DateTime.Now;
@@ -124,7 +134,7 @@ public class Backup : IBackup
                 });
                 enumerationTasks.Add(projectTask);
             }
-            
+
             await Task.WhenAll(enumerationTasks);
             enumerationChannel.Writer.Complete();
         });
@@ -153,17 +163,17 @@ public class Backup : IBackup
                 var downloadStartTime = DateTime.Now;
                 Logger.Info($"=> Downloading project {project.Name} ({project.ProjectId})");
                 Logger.Info("Backup beginning.");
-                
+
                 // Use sanitized project name for directory creation
                 var sanitizedProjectName = SanitizeProjectName(project.Name);
                 await project.DownloadContentsRecursively(Path.Combine(Config.BackupDirectory, sanitizedProjectName));
-                
+
                 var downloadEndTime = DateTime.Now;
                 var downloadTime = downloadEndTime - downloadStartTime;
                 _totalDownloadTime = _totalDownloadTime.Add(downloadTime);
                 lastPipelineActivityTime = downloadEndTime;
                 _projectsProcessed++;
-                
+
                 project.BackupFinishedAt = downloadEndTime;
                 Logger.Info($"=> Finished downloading project {project.Name} ({project.ProjectId})");
                 LogBackupSummaryLine(project);
@@ -173,7 +183,12 @@ public class Backup : IBackup
         // Wait for both tasks to complete
         await Task.WhenAll(enumerationTask, downloadTask);
         _backupEndTime = DateTime.Now;
-        
+
+        // Account for the subtrees rollup pruning skipped before anything reports on, or deletes,
+        // files based on the enumerated tree alone.
+        _prunedTotalsByProjectId = CalculatePrunedTotals(_projects);
+        var unmaterializedFolders = MaterializePrunedFiles(_projects);
+
         // Clean up obsolete files in sync mode
         if (Config.BackupsToRotate == 1)
         {
@@ -184,12 +199,12 @@ public class Backup : IBackup
 
         // Log incremental backup statistics
         LogIncrementalBackupStats();
-        
+
         // Log pipeline efficiency statistics
         LogPipelineEfficiencyStats();
 
         // Generate and save backup manifest for incremental backups
-        GenerateBackupManifest(_projects);
+        GenerateBackupManifest(_projects, unmaterializedFolders);
 
         // Rotate old backups AFTER successful backup completion
         RotateBackupDirectories();
@@ -237,14 +252,14 @@ public class Backup : IBackup
 
         var htmlSummary = new List<string> { "<h2>ACCBackup Backup Summary</h2>" };
         htmlSummary.AddRange(GetBackupSummary(projects).Select(s => $"<p>{s}</p>"));
-        
+
         // Add incremental backup statistics to email
         var incrementalStatsHtml = GetIncrementalBackupStatsHtml();
         if (!string.IsNullOrEmpty(incrementalStatsHtml))
         {
             htmlSummary.Add(incrementalStatsHtml);
         }
-        
+
         // Add pipeline efficiency statistics to email
         var pipelineStatsHtml = GetPipelineEfficiencyHtml();
         if (!string.IsNullOrEmpty(pipelineStatsHtml))
@@ -311,6 +326,14 @@ public class Backup : IBackup
         {
             summary.Add(
                 @$"  => Backed up {totalFileSizeOnDiskInMb}/{totalApiReportedStorageSizeInMb} MB in {backupDuration} to {Config.BackupDirectory}");
+
+            // The walked tree excludes pruned subtrees, so state their contribution explicitly
+            // rather than letting the totals above read as a shrinking backup.
+            var prunedFiles = _prunedTotalsByProjectId.Values.Sum(t => t.files);
+            var prunedBytes = _prunedTotalsByProjectId.Values.Sum(t => t.bytes);
+            if (prunedFiles > 0)
+                summary.Add(
+                    @$"  => Plus {prunedFiles} unchanged files ({FormatBytes(prunedBytes)}) in folders skipped by rollup pruning, giving {totalFileCount + prunedFiles} files in total");
         }
         return summary;
     }
@@ -372,7 +395,15 @@ public class Backup : IBackup
         var isInSyncMode = Config.BackupsToRotate == 1;
 
         var summary = string.Empty;
-        if (isDryRun && allFilesProcessed && allFoldersCreated)
+        if (project.EnumerationFailed)
+        {
+            // An empty tree from a failed enumeration otherwise satisfies every success predicate
+            // below and would be reported as a clean backup.
+            summary +=
+                $"  + [ERROR] {project.Name} ({project.ProjectId}) - enumeration failed after {backupDuration}, " +
+                "previous manifest entries left untouched";
+        }
+        else if (isDryRun && allFilesProcessed && allFoldersCreated)
         {
             summary +=
                 $"  + [SUCCESS] {project.Name} ({project.ProjectId}) - dry run (no files downloaded) - {filesWithInfo}/{totalFiles} files across {foldersCreated}/{totalFolders} folders ({totalApiReportedStorageSizeInMb} MB reported)";
@@ -406,7 +437,7 @@ public class Backup : IBackup
                 summary += "  + [ERROR] ";
 
             summary += $"{project.Name} ({project.ProjectId}) - {totalFileSizeOnDiskInMb}/{totalApiReportedStorageSizeInMb} MB in {backupDuration} - ";
-            
+
             if (isInSyncMode && (stats.copied > 0 || stats.downloaded > 0))
             {
                 summary += $"{stats.copied} unchanged, {stats.downloaded} downloaded, {filesWithInfo}/{totalFiles} total files in {foldersCreated}/{totalFolders} folders";
@@ -420,6 +451,9 @@ public class Backup : IBackup
                 summary += $"{filesWithInfo}/{totalFiles} files backed up in {foldersCreated}/{totalFolders} folders";
             }
         }
+
+        if (_prunedTotalsByProjectId.TryGetValue(project.ProjectId, out var pruned) && pruned.files > 0)
+            summary += $" (+{pruned.files} unchanged files in skipped folders)";
 
         return summary;
     }
@@ -457,7 +491,7 @@ public class Backup : IBackup
             Logger.Debug("In-place sync mode enabled, skipping directory rotation");
             return;
         }
-        
+
         Logger.Debug("Rotating backup directories.");
 
         // Get the executable's directory to ensure we never try to delete it
@@ -519,16 +553,147 @@ public class Backup : IBackup
             .Where(dir => backupDirPattern.IsMatch(dir.Name))
             .ToList();
     }
-    
+
+    /// <summary>
+    /// Turns rollup pruning on when it is safe to do so and explains in the log when it is not.
+    /// </summary>
+    private void ConfigureRollupPruning()
+    {
+        if (_previousBackupManifest is null)
+        {
+            ApiClient.PruneUnchangedFolders = false;
+            return;
+        }
+
+        if (Config.DryRun)
+        {
+            ApiClient.PruneUnchangedFolders = false;
+            Logger.Info("=> Rollup pruning disabled for dry runs so the enumeration reflects the whole account");
+            return;
+        }
+
+        if (_previousBackupManifest.Folders.Count == 0)
+        {
+            ApiClient.PruneUnchangedFolders = false;
+            Logger.Info(
+                "=> Previous manifest has no folder rollups (written by an earlier version), enumerating every folder this run");
+            return;
+        }
+
+        ApiClient.PruneUnchangedFolders = true;
+        Logger.Info(
+            $"=> Rollup pruning enabled using {_previousBackupManifest.Folders.Count} folder rollups from the previous backup");
+    }
+
+    /// <summary>
+    /// Every folder whose subtree was skipped, paired with its manifest-relative path. Pruned
+    /// folders never nest inside one another, so these paths are disjoint. Projects whose
+    /// enumeration failed are excluded -- their trees are handled wholesale elsewhere.
+    /// </summary>
+    private List<(ProjectBackup project, string manifestPath)> GetPrunedFolders(List<ProjectBackup> projects)
+    {
+        var pruned = new List<(ProjectBackup, string)>();
+        foreach (var project in projects)
+        {
+            if (project.EnumerationFailed) continue;
+            if (!_projectPathPrefixes.TryGetValue(project.ProjectId, out var prefix)) continue;
+            foreach (var folder in project.SubfoldersRecursive.Where(f => f.Pruned))
+                pruned.Add((project, $"{prefix}/{folder.GetPath()[1..]}".Replace('\\', '/')));
+        }
+
+        return pruned;
+    }
+
+    /// <summary>
+    /// Sums the files and bytes hidden behind pruned folders so the backup summary can report the
+    /// full picture rather than only what was walked this run.
+    /// </summary>
+    private Dictionary<string, (int files, long bytes)> CalculatePrunedTotals(List<ProjectBackup> projects)
+    {
+        var totals = new Dictionary<string, (int files, long bytes)>();
+        if (_previousBackupManifest is null) return totals;
+
+        foreach (var (project, manifestPath) in GetPrunedFolders(projects))
+        {
+            totals.TryGetValue(project.ProjectId, out var current);
+            foreach (var (_, entry) in _previousBackupManifest.GetFilesUnder(manifestPath))
+                current = (current.files + 1, current.bytes + entry.StorageSize);
+            totals[project.ProjectId] = current;
+        }
+
+        return totals;
+    }
+
+    /// <summary>
+    /// In versioned mode each run writes a fresh timestamped directory, so files behind a pruned
+    /// folder still have to be placed there -- copied from the previous backup rather than
+    /// re-downloaded. In-place sync mode needs nothing: the files never moved.
+    /// </summary>
+    /// <returns>
+    /// Manifest paths of pruned folders that could not be fully carried forward. Their rollups and
+    /// file entries are withheld from the new manifest so the next run re-enumerates them.
+    /// </returns>
+    private HashSet<string> MaterializePrunedFiles(List<ProjectBackup> projects)
+    {
+        var failedFolders = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (Config.BackupsToRotate == 1) return failedFolders;
+        if (_previousBackupManifest is null) return failedFolders;
+
+        var previousBackupDirectory = _previousBackupManifest.BackupDirectory;
+        if (string.IsNullOrWhiteSpace(previousBackupDirectory)) return failedFolders;
+
+        var prunedFolders = GetPrunedFolders(projects);
+        if (prunedFolders.Count == 0) return failedFolders;
+
+        Logger.Info($"=> Carrying {prunedFolders.Count} unchanged folder(s) forward from the previous backup");
+        var copiedCount = 0;
+        long copiedBytes = 0;
+
+        foreach (var (_, manifestPath) in prunedFolders)
+        foreach (var (key, entry) in _previousBackupManifest.GetFilesUnder(manifestPath))
+        {
+            var relativePath = key.Replace('/', Path.DirectorySeparatorChar);
+            var sourcePath = Path.Combine(previousBackupDirectory, relativePath);
+            var destinationPath = Path.Combine(Config.BackupDirectory, relativePath);
+            try
+            {
+                var destinationDirectory = Path.GetDirectoryName(destinationPath);
+                if (!string.IsNullOrEmpty(destinationDirectory)) Directory.CreateDirectory(destinationDirectory);
+                File.Copy(sourcePath, destinationPath, true);
+
+                var copiedInfo = new FileInfo(destinationPath);
+                if (copiedInfo.Length != entry.StorageSize)
+                    throw new IOException(
+                        $"copied {copiedInfo.Length} bytes but the manifest reports {entry.StorageSize}");
+
+                copiedCount++;
+                copiedBytes += entry.StorageSize;
+            }
+            catch (Exception ex)
+            {
+                Logger.Warn(
+                    $"Failed to carry forward {key} from the previous backup: {ex.Message}. " +
+                    "This folder will be re-enumerated on the next run.");
+                failedFolders.Add(manifestPath);
+            }
+        }
+
+        Logger.Info($"=> Carried forward {copiedCount} file(s) ({FormatBytes(copiedBytes)}) without contacting Autodesk");
+        if (failedFolders.Count > 0)
+            Logger.Warn($"{failedFolders.Count} pruned folder(s) could not be fully carried forward, see warnings above");
+
+        return failedFolders;
+    }
+
     private Task CleanupObsoleteFiles(List<ProjectBackup> projects)
     {
         // Only cleanup in sync mode with an existing manifest
         if (Config.BackupsToRotate != 1 || _previousBackupManifest == null)
             return Task.CompletedTask;
-            
+
         Logger.Info("=> Checking for obsolete files to remove");
         var currentFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        
+
         // Build set of all current files from ACC
         foreach (var project in projects)
         {
@@ -540,23 +705,40 @@ public class Backup : IBackup
                 currentFiles.Add(relativePath);
             }
         }
-        
+
+        // A file absent from the enumerated tree is only obsolete if we actually looked for it.
+        // Pruned subtrees and projects that failed to enumerate were never walked, so their files
+        // are still current and must be protected from deletion.
+        var protectedPrefixes = GetPrunedFolders(projects)
+            .Select(p => p.manifestPath)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var protectedProjectIds = projects
+            .Where(p => p.EnumerationFailed)
+            .Select(p => p.ProjectId)
+            .ToHashSet(StringComparer.Ordinal);
+
+        if (protectedPrefixes.Count > 0)
+            Logger.Debug($"Excluding {protectedPrefixes.Count} pruned folder(s) from obsolete-file cleanup");
+        if (protectedProjectIds.Count > 0)
+            Logger.Warn(
+                $"Excluding {protectedProjectIds.Count} project(s) that failed to enumerate from obsolete-file cleanup");
+
         // Find and delete obsolete files
         var filesToDelete = new List<string>();
         foreach (var kvp in _previousBackupManifest.Files)
         {
-            if (!currentFiles.Contains(kvp.Key))
-            {
-                filesToDelete.Add(kvp.Key);
-            }
+            if (currentFiles.Contains(kvp.Key)) continue;
+            if (BackupManifest.IsUnderAnyFolder(kvp.Key, protectedPrefixes)) continue;
+            if (kvp.Value?.ProjectId is not null && protectedProjectIds.Contains(kvp.Value.ProjectId)) continue;
+            filesToDelete.Add(kvp.Key);
         }
-        
+
         if (filesToDelete.Count == 0)
         {
             Logger.Info("=> No obsolete files found");
             return Task.CompletedTask;
         }
-        
+
         // Delete obsolete files
         var deletedCount = 0;
         foreach (var relativePath in filesToDelete)
@@ -576,17 +758,17 @@ public class Backup : IBackup
                 }
             }
         }
-        
+
         if (deletedCount > 0)
         {
             Logger.Info($"=> Removed {deletedCount} obsolete file(s)");
             // Clean up empty directories after file deletion
             CleanupEmptyDirectories(Config.BackupDirectory);
         }
-        
+
         return Task.CompletedTask;
     }
-    
+
     private void CleanupEmptyDirectories(string path)
     {
         try
@@ -601,13 +783,13 @@ public class Backup : IBackup
                 }
                 return;
             }
-            
+
             // Recursively clean subdirectories first
             foreach (var directory in Directory.GetDirectories(path))
             {
                 CleanupEmptyDirectories(directory);
             }
-            
+
             // If this directory is now empty, delete it
             if (!Directory.EnumerateFileSystemEntries(path).Any())
             {
@@ -672,7 +854,7 @@ public class Backup : IBackup
     private void LogIncrementalBackupStats()
     {
         var stats = ApiClient.GetIncrementalStats();
-        if (stats.copied > 0 || stats.downloaded > 0)
+        if (stats.copied > 0 || stats.downloaded > 0 || stats.filesSkipped > 0)
         {
             Logger.Info("=================================================================================");
             Logger.Info("=> Incremental Backup Statistics:");
@@ -681,12 +863,22 @@ public class Backup : IBackup
                 $"    Files downloaded from Autodesk: {stats.downloaded} ({FormatBytes(stats.bytesDownloaded)})");
             Logger.Info($"    Total files processed: {stats.copied + stats.downloaded}");
 
+            if (stats.foldersPruned > 0)
+            {
+                var verb = Config.BackupsToRotate == 1 ? "left in place" : "carried forward";
+                Logger.Info(
+                    $"    Folders skipped by rollup pruning: {stats.foldersPruned} " +
+                    $"({stats.filesSkipped} files, {FormatBytes(stats.bytesSkipped)} {verb})");
+                Logger.Info(
+                    $"    Folder listing API calls avoided: at least {stats.foldersPruned}");
+            }
+
             if (stats.copied > 0)
             {
                 var timeSaved = EstimateTimeSaved(stats.bytesCopied);
                 Logger.Info($"    Estimated time saved: {timeSaved}");
                 Logger.Info($"    Bandwidth saved: {FormatBytes(stats.bytesCopied)}");
-                
+
                 // Show efficiency percentage
                 var totalBytes = stats.bytesCopied + stats.bytesDownloaded;
                 if (totalBytes > 0)
@@ -732,41 +924,48 @@ public class Backup : IBackup
             return $"{timeSaved.Minutes}m {timeSaved.Seconds}s";
         return $"{timeSaved.Seconds}s";
     }
-    
+
     private string GetIncrementalBackupStatsHtml()
     {
         var stats = ApiClient.GetIncrementalStats();
-        if (stats.copied == 0 && stats.downloaded == 0)
+        if (stats.copied == 0 && stats.downloaded == 0 && stats.filesSkipped == 0)
             return string.Empty;
-        
+
         var html = new List<string>();
         html.Add("<hr>");
         html.Add("<h3>Incremental Backup Statistics</h3>");
         html.Add("<table style='border-collapse: collapse; margin: 10px 0;'>");
-        
+
         // Data copied from previous backup
         html.Add($"<tr><td style='padding: 5px 15px 5px 0;'><strong>Data copied from previous backup:</strong></td>");
         html.Add($"<td style='padding: 5px;'>{stats.copied} files ({FormatBytes(stats.bytesCopied)})</td></tr>");
-        
+
         // Data downloaded from Autodesk
         html.Add($"<tr><td style='padding: 5px 15px 5px 0;'><strong>Data downloaded from Autodesk:</strong></td>");
         html.Add($"<td style='padding: 5px;'>{stats.downloaded} files ({FormatBytes(stats.bytesDownloaded)})</td></tr>");
-        
+
         // Total files processed
         html.Add($"<tr><td style='padding: 5px 15px 5px 0;'><strong>Total files processed:</strong></td>");
         html.Add($"<td style='padding: 5px;'>{stats.copied + stats.downloaded}</td></tr>");
-        
+
+        if (stats.foldersPruned > 0)
+        {
+            html.Add($"<tr><td style='padding: 5px 15px 5px 0;'><strong>Folders skipped (unchanged):</strong></td>");
+            html.Add(
+                $"<td style='padding: 5px;'>{stats.foldersPruned} folders, {stats.filesSkipped} files ({FormatBytes(stats.bytesSkipped)})</td></tr>");
+        }
+
         if (stats.copied > 0)
         {
             // Bandwidth saved
             html.Add($"<tr><td style='padding: 5px 15px 5px 0;'><strong>Bandwidth saved:</strong></td>");
             html.Add($"<td style='padding: 5px;'>{FormatBytes(stats.bytesCopied)}</td></tr>");
-            
+
             // Estimated time saved
             var timeSaved = EstimateTimeSaved(stats.bytesCopied);
             html.Add($"<tr><td style='padding: 5px 15px 5px 0;'><strong>Estimated time saved:</strong></td>");
             html.Add($"<td style='padding: 5px;'>{timeSaved}</td></tr>");
-            
+
             // Efficiency percentage
             var totalBytes = stats.bytesCopied + stats.bytesDownloaded;
             if (totalBytes > 0)
@@ -781,97 +980,97 @@ public class Backup : IBackup
                 html.Add($"<td style='padding: 5px;'>{efficiencyPercent:F2}% data reused from previous backup</td></tr>");
             }
         }
-        
+
         html.Add("</table>");
-        
+
         return string.Join("", html);
     }
-    
+
     private void LogPipelineEfficiencyStats()
     {
         if (_projectsProcessed == 0)
             return;
-            
+
         var totalPipelineTime = _totalDownloadTime + _totalWaitTime;
         if (totalPipelineTime == TimeSpan.Zero)
             return;
-            
+
         var efficiencyPercent = (_totalDownloadTime.TotalSeconds / totalPipelineTime.TotalSeconds) * 100;
-        var averageWaitTime = _projectsProcessed > 1 ? 
-            TimeSpan.FromSeconds(_totalWaitTime.TotalSeconds / (_projectsProcessed - 1)) : 
+        var averageWaitTime = _projectsProcessed > 1 ?
+            TimeSpan.FromSeconds(_totalWaitTime.TotalSeconds / (_projectsProcessed - 1)) :
             TimeSpan.Zero;
-        
+
         Logger.Info("=================================================================================");
         Logger.Info("=> Pipeline Efficiency Statistics:");
         Logger.Info($"    Total pipeline time: {FormatTimeSpan(totalPipelineTime)}");
         Logger.Info($"    Active download time: {FormatTimeSpan(_totalDownloadTime)} ({efficiencyPercent:F1}%)");
         Logger.Info($"    Wait time (idle): {FormatTimeSpan(_totalWaitTime)} ({(100 - efficiencyPercent):F1}%)");
         Logger.Info($"    Projects processed: {_projectsProcessed}");
-        
+
         if (_projectsProcessed > 1)
         {
             Logger.Info($"    Average wait between projects: {FormatTimeSpan(averageWaitTime)}");
         }
-        
+
         if (_totalWaitTime.TotalMinutes > 1)
         {
             Logger.Info($"    Note: {FormatTimeSpan(_totalWaitTime)} spent waiting for project enumeration");
         }
-        
+
         Logger.Info("=================================================================================");
     }
-    
+
     private string GetPipelineEfficiencyHtml()
     {
         if (_projectsProcessed == 0)
             return string.Empty;
-            
+
         var totalPipelineTime = _totalDownloadTime + _totalWaitTime;
         if (totalPipelineTime == TimeSpan.Zero)
             return string.Empty;
-            
+
         var efficiencyPercent = (_totalDownloadTime.TotalSeconds / totalPipelineTime.TotalSeconds) * 100;
-        var averageWaitTime = _projectsProcessed > 1 ? 
-            TimeSpan.FromSeconds(_totalWaitTime.TotalSeconds / (_projectsProcessed - 1)) : 
+        var averageWaitTime = _projectsProcessed > 1 ?
+            TimeSpan.FromSeconds(_totalWaitTime.TotalSeconds / (_projectsProcessed - 1)) :
             TimeSpan.Zero;
-        
+
         var html = new List<string>();
         html.Add("<hr>");
         html.Add("<h3>Pipeline Efficiency Statistics</h3>");
         html.Add("<table style='border-collapse: collapse; margin: 10px 0;'>");
-        
+
         // Total pipeline time
         html.Add($"<tr><td style='padding: 5px 15px 5px 0;'><strong>Total pipeline time:</strong></td>");
         html.Add($"<td style='padding: 5px;'>{FormatTimeSpan(totalPipelineTime)}</td></tr>");
-        
+
         // Active download time
         html.Add($"<tr><td style='padding: 5px 15px 5px 0;'><strong>Active download time:</strong></td>");
         html.Add($"<td style='padding: 5px;'>{FormatTimeSpan(_totalDownloadTime)} ({efficiencyPercent:F1}%)</td></tr>");
-        
+
         // Wait time
         html.Add($"<tr><td style='padding: 5px 15px 5px 0;'><strong>Wait time (idle):</strong></td>");
         html.Add($"<td style='padding: 5px;'>{FormatTimeSpan(_totalWaitTime)} ({(100 - efficiencyPercent):F1}%)</td></tr>");
-        
+
         // Projects processed
         html.Add($"<tr><td style='padding: 5px 15px 5px 0;'><strong>Projects processed:</strong></td>");
         html.Add($"<td style='padding: 5px;'>{_projectsProcessed}</td></tr>");
-        
+
         if (_projectsProcessed > 1)
         {
             // Average wait time
             html.Add($"<tr><td style='padding: 5px 15px 5px 0;'><strong>Average wait between projects:</strong></td>");
             html.Add($"<td style='padding: 5px;'>{FormatTimeSpan(averageWaitTime)}</td></tr>");
         }
-        
+
         // Pipeline efficiency
         html.Add($"<tr><td style='padding: 5px 15px 5px 0;'><strong>Pipeline efficiency:</strong></td>");
         html.Add($"<td style='padding: 5px;'>{efficiencyPercent:F1}% time spent downloading</td></tr>");
-        
+
         html.Add("</table>");
-        
+
         return string.Join("", html);
     }
-    
+
     private string FormatTimeSpan(TimeSpan timeSpan)
     {
         if (timeSpan.TotalHours >= 1)
@@ -911,7 +1110,7 @@ public class Backup : IBackup
                     return null;
                 }
             }
-            
+
             // Get parent directory (two levels up since we already created the timestamped directory)
             // Config.BackupDirectory is now something like C:\Backup\2024-01-01_10-30
             // We need to look in C:\Backup for other backup directories
@@ -1023,7 +1222,7 @@ public class Backup : IBackup
         return sanitized;
     }
 
-    private void GenerateBackupManifest(List<ProjectBackup> projects)
+    private void GenerateBackupManifest(List<ProjectBackup> projects, HashSet<string>? unmaterializedFolders = null)
     {
         try
         {
@@ -1033,33 +1232,112 @@ public class Backup : IBackup
                 BackupDirectory = Config.BackupDirectory
             };
 
+            // Folders whose contents could not be carried into this backup are treated as if they
+            // had never been pruned, so the next run walks and re-downloads them.
+            var withheld = unmaterializedFolders ?? new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var prunedFolders = GetPrunedFolders(projects)
+                .Select(p => p.manifestPath)
+                .Where(path => !withheld.Contains(path))
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            var failedProjectIds = projects
+                .Where(p => p.EnumerationFailed)
+                .Select(p => p.ProjectId)
+                .ToHashSet(StringComparer.Ordinal);
+
             foreach (var project in projects)
-            foreach (var file in project.FilesRecursive)
             {
+                if (project.EnumerationFailed) continue;
+
                 // Use sanitized project name and normalize path separators for consistent manifest keys
                 var sanitizedProjectName = SanitizeProjectName(project.Name);
-                var relativePath = Path.Combine(sanitizedProjectName, file.GetPath()[1..])
-                    .Replace('\\', '/');
 
-                var entry = new FileManifestEntry
+                foreach (var file in project.FilesRecursive)
                 {
-                    FileId = file.FileId,
-                    VersionNumber = file.VersionNumber,
-                    LastModifiedTime = file.LastModifiedTime,
-                    StorageSize = file.StorageSize,
-                    Name = file.Name,
-                    ProjectId = project.ProjectId
-                };
-                manifest.AddFile(relativePath, entry);
+                    var relativePath = Path.Combine(sanitizedProjectName, file.GetPath()[1..])
+                        .Replace('\\', '/');
+
+                    var entry = new FileManifestEntry
+                    {
+                        FileId = file.FileId,
+                        VersionNumber = file.VersionNumber,
+                        LastModifiedTime = file.LastModifiedTime,
+                        StorageSize = file.StorageSize,
+                        Name = file.Name,
+                        ProjectId = project.ProjectId
+                    };
+                    manifest.AddFile(relativePath, entry);
+                }
+
+                // Record a rollup for every folder we saw, including pruned ones -- their rollup came
+                // from the parent listing and is exactly what we compared against.
+                var folders = project.RootFolder is null
+                    ? Enumerable.Empty<Folder>()
+                    : new[] { project.RootFolder }.Concat(project.SubfoldersRecursive);
+                foreach (var folder in folders)
+                {
+                    var folderPath = $"{sanitizedProjectName}/{folder.GetPath()[1..]}".Replace('\\', '/');
+                    if (folder.Pruned && withheld.Contains(folderPath)) continue;
+
+                    manifest.AddFolder(new FolderManifestEntry
+                    {
+                        FolderId = folder.FolderId,
+                        ProjectId = project.ProjectId,
+                        Path = folderPath,
+                        LastModifiedTimeRollup = folder.LastModifiedTimeRollup
+                    });
+                }
             }
+
+            CarryForwardUnwalkedEntries(manifest, prunedFolders, failedProjectIds);
 
             var manifestPath = Path.Combine(Config.BackupDirectory, "BackupManifest.json");
             manifest.SaveToFile(manifestPath);
-            Logger.Info($"=> Backup manifest saved to {manifestPath}");
+            Logger.Info($"=> Backup manifest saved to {manifestPath} " +
+                        $"({manifest.Files.Count} files, {manifest.Folders.Count} folders)");
         }
         catch (Exception ex)
         {
             Logger.Warn($"Failed to generate backup manifest: {ex.Message}");
         }
+    }
+
+    /// <summary>
+    /// Copies the previous manifest's entries for everything this run did not walk into the new
+    /// manifest. Without this a pruned subtree would vanish from the record, and the next run would
+    /// treat its files as obsolete and delete them.
+    /// </summary>
+    private void CarryForwardUnwalkedEntries(BackupManifest manifest, HashSet<string> prunedFolders,
+        HashSet<string> failedProjectIds)
+    {
+        if (_previousBackupManifest is null) return;
+        if (prunedFolders.Count == 0 && failedProjectIds.Count == 0) return;
+
+        var carriedFiles = 0;
+        foreach (var (key, entry) in _previousBackupManifest.Files)
+        {
+            if (entry is null || manifest.Files.ContainsKey(key)) continue;
+
+            var isFailedProject = entry.ProjectId is not null && failedProjectIds.Contains(entry.ProjectId);
+            if (!isFailedProject && !BackupManifest.IsUnderAnyFolder(key, prunedFolders)) continue;
+
+            manifest.AddFile(key, entry);
+            carriedFiles++;
+        }
+
+        var carriedFolders = 0;
+        foreach (var (folderId, entry) in _previousBackupManifest.Folders)
+        {
+            if (entry is null || manifest.Folders.ContainsKey(folderId)) continue;
+
+            var isFailedProject = entry.ProjectId is not null && failedProjectIds.Contains(entry.ProjectId);
+            if (!isFailedProject && !BackupManifest.IsUnderAnyFolder(entry.Path ?? string.Empty, prunedFolders)) continue;
+
+            manifest.AddFolder(entry);
+            carriedFolders++;
+        }
+
+        if (carriedFiles > 0 || carriedFolders > 0)
+            Logger.Info(
+                $"=> Carried {carriedFiles} file and {carriedFolders} folder record(s) forward for subtrees that were not walked this run");
     }
 }
