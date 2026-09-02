@@ -5,10 +5,12 @@ namespace ACC.ApiClient;
 
 /*
  * Minimal ACC Admin API (project user management) support.
- * https://aps.autodesk.com/en/docs/acc/v1/reference/http/admin-projects-project-Id-users-GET/
+ * Endpoints and headers follow Autodesk's official 2-legged tutorial collection:
+ * https://github.com/autodesk-platform-services/aps-acc.admin.api-postman.collection
  *
- * Requires the token to be requested with "account:read account:write" (see ApiClientOptions.Scope)
- * and, for a 2-legged token, an x-user-id of an account admin (see ApiClientOptions/AdminUserId below).
+ * Requires the token to be requested with "account:read account:write" (see ApiClientOptions.Scope).
+ * Write calls with a 2-legged token must also carry a "User-Id" header naming an account admin;
+ * pure 2-legged without a user is not supported for writes. Reads do not need it.
  */
 public partial class ApiClient
 {
@@ -17,13 +19,36 @@ public partial class ApiClient
     private const string AdminMoreDetailsUrl =
         "https://aps.autodesk.com/en/docs/acc/v1/reference/http/admin-projects-project-Id-users-GET/";
 
-    // Autodesk id of an account admin, sent as x-user-id on Admin API calls made with a 2-legged token.
+    // BIM 360 user id of an account admin, sent as the User-Id header on Admin API writes.
     public string? AdminUserId { get; set; }
 
     // The Data Management api returns project ids prefixed with "b."; the Admin api wants the raw id.
     private static string StripProjectIdPrefix(string projectId)
     {
         return projectId.StartsWith("b.") ? projectId[2..] : projectId;
+    }
+
+    // Resolves the User-Id value for an account admin from their email address.
+    // GET hq/v1/accounts/{accountId}/users/search?email=...
+    public async Task<string?> FindAccountAdminId(string email)
+    {
+        Config.Logger?.Trace("Top");
+        var endpoint =
+            $"https://developer.api.autodesk.com/hq/v1/accounts/{StripProjectIdPrefix(Config.AccountId)}/users/search?email={Uri.EscapeDataString(email)}";
+        const string moreDetailsUrl =
+            "https://aps.autodesk.com/en/docs/bim360/v1/reference/http/users-search-GET/";
+        var responseString = string.Empty;
+        await Config.RetryPolicy.ExecuteAsync(async () =>
+        {
+            await EnsureAccessToken();
+            var response = await Config.HttpClient.GetAsync(endpoint);
+            responseString = await response.Content.ReadAsStringAsync();
+            HandleUnsuccessfulStatusCode(responseString, response, moreDetailsUrl);
+        });
+        var results = JsonConvert.DeserializeObject<List<AccountUser>>(responseString);
+        var adminId = results?.FirstOrDefault()?.Id;
+        Config.Logger?.Debug($"Resolved account admin id for {email}: {adminId ?? "<not found>"}");
+        return adminId;
     }
 
     public async Task<List<ProjectUser>> GetProjectUsers(string projectId)
@@ -40,7 +65,6 @@ public partial class ApiClient
             {
                 await EnsureAccessToken();
                 using var request = new HttpRequestMessage(HttpMethod.Get, pageEndpoint);
-                AddAdminUserIdHeader(request);
                 var response = await Config.HttpClient.SendAsync(request);
                 responseString = await response.Content.ReadAsStringAsync();
                 HandleUnsuccessfulStatusCode(responseString, response, AdminMoreDetailsUrl);
@@ -65,7 +89,7 @@ public partial class ApiClient
     public async Task AddProjectUser(string projectId, string email, string productKey, string productAccess)
     {
         Config.Logger?.Trace("Top");
-        var endpoint = $"{AdminApiBase}/v2/projects/{StripProjectIdPrefix(projectId)}/users";
+        var endpoint = $"{AdminApiBase}/v1/projects/{StripProjectIdPrefix(projectId)}/users";
         var payload = JsonConvert.SerializeObject(new
         {
             email,
@@ -75,7 +99,7 @@ public partial class ApiClient
         {
             await EnsureAccessToken();
             using var request = new HttpRequestMessage(HttpMethod.Post, endpoint);
-            AddAdminUserIdHeader(request);
+            AddUserIdHeader(request);
             request.Content = new StringContent(payload, Encoding.UTF8, "application/json");
             var response = await Config.HttpClient.SendAsync(request);
             var responseString = await response.Content.ReadAsStringAsync();
@@ -92,7 +116,7 @@ public partial class ApiClient
         {
             await EnsureAccessToken();
             using var request = new HttpRequestMessage(HttpMethod.Delete, endpoint);
-            AddAdminUserIdHeader(request);
+            AddUserIdHeader(request);
             var response = await Config.HttpClient.SendAsync(request);
             var responseString = await response.Content.ReadAsStringAsync();
             HandleUnsuccessfulStatusCode(responseString, response, AdminMoreDetailsUrl);
@@ -100,10 +124,23 @@ public partial class ApiClient
         Config.Logger?.Debug($"Removed user {projectUserId} from project {projectId}");
     }
 
-    private void AddAdminUserIdHeader(HttpRequestMessage request)
+    private void AddUserIdHeader(HttpRequestMessage request)
     {
-        if (!string.IsNullOrWhiteSpace(AdminUserId)) request.Headers.Add("x-user-id", AdminUserId);
+        if (string.IsNullOrWhiteSpace(AdminUserId))
+            throw new InvalidOperationException(
+                "AdminUserId is required for ACC Admin API writes with a 2-legged token. " +
+                "Pass --adminemail or --adminuserid.");
+        request.Headers.Add("User-Id", AdminUserId);
     }
+}
+
+public class AccountUser
+{
+    [JsonProperty("id")] public string Id { get; set; } = string.Empty;
+
+    [JsonProperty("uid")] public string? Uid { get; set; }
+
+    [JsonProperty("email")] public string? Email { get; set; }
 }
 
 public class ProjectUsersResponse

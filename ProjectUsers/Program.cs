@@ -38,7 +38,27 @@ var apiClient = TwoLeggedApiClient
         o.Scope = "data:read account:read account:write";
     })
     .Create();
+
+// Admin API writes with a 2-legged token must name an account admin via the User-Id header.
 apiClient.AdminUserId = options.AdminUserId;
+if (string.IsNullOrWhiteSpace(apiClient.AdminUserId) && !string.IsNullOrWhiteSpace(options.AdminEmail))
+{
+    apiClient.AdminUserId = await apiClient.FindAccountAdminId(options.AdminEmail);
+    if (apiClient.AdminUserId is null)
+    {
+        logger.Error($"No account user found for --adminemail {options.AdminEmail}");
+        return 1;
+    }
+
+    logger.Info($"Acting on behalf of {options.AdminEmail} (User-Id {apiClient.AdminUserId})");
+}
+
+if (string.IsNullOrWhiteSpace(apiClient.AdminUserId) && !options.DryRun)
+{
+    logger.Error("--adminemail or --adminuserid is required: the ACC Admin API rejects writes from a " +
+                 "2-legged token that does not name an account admin.");
+    return 1;
+}
 
 var projects = await apiClient.GetProjects();
 if (options.NumberOfProjects > 0) projects = projects.Take(options.NumberOfProjects).ToList();

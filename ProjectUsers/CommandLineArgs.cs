@@ -27,8 +27,13 @@ public class CommandLineArgs
         HelpText = "Remove the user from the projects instead of adding them.")]
     public bool Remove { get; set; }
 
+    [Option("adminemail", Required = false,
+        HelpText = "Email of an account admin to act on behalf of. Resolved to a User-Id via the HQ users search. " +
+                   "Required for add/remove with a 2-legged token unless --adminuserid is given.")]
+    public string? AdminEmail { get; set; }
+
     [Option("adminuserid", Required = false,
-        HelpText = "Autodesk id of an account admin, sent as x-user-id (required for 2-legged Admin API calls).")]
+        HelpText = "BIM 360 user id of an account admin, sent as the User-Id header. Alternative to --adminemail.")]
     public string? AdminUserId { get; set; }
 
     [Option("product", Required = false, Default = "docs",
