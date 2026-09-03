@@ -650,33 +650,33 @@ public class Backup : IBackup
         long copiedBytes = 0;
 
         foreach (var (_, manifestPath) in prunedFolders)
-        foreach (var (key, entry) in _previousBackupManifest.GetFilesUnder(manifestPath))
-        {
-            var relativePath = key.Replace('/', Path.DirectorySeparatorChar);
-            var sourcePath = Path.Combine(previousBackupDirectory, relativePath);
-            var destinationPath = Path.Combine(Config.BackupDirectory, relativePath);
-            try
+            foreach (var (key, entry) in _previousBackupManifest.GetFilesUnder(manifestPath))
             {
-                var destinationDirectory = Path.GetDirectoryName(destinationPath);
-                if (!string.IsNullOrEmpty(destinationDirectory)) Directory.CreateDirectory(destinationDirectory);
-                File.Copy(sourcePath, destinationPath, true);
+                var relativePath = key.Replace('/', Path.DirectorySeparatorChar);
+                var sourcePath = Path.Combine(previousBackupDirectory, relativePath);
+                var destinationPath = Path.Combine(Config.BackupDirectory, relativePath);
+                try
+                {
+                    var destinationDirectory = Path.GetDirectoryName(destinationPath);
+                    if (!string.IsNullOrEmpty(destinationDirectory)) Directory.CreateDirectory(destinationDirectory);
+                    File.Copy(sourcePath, destinationPath, true);
 
-                var copiedInfo = new FileInfo(destinationPath);
-                if (copiedInfo.Length != entry.StorageSize)
-                    throw new IOException(
-                        $"copied {copiedInfo.Length} bytes but the manifest reports {entry.StorageSize}");
+                    var copiedInfo = new FileInfo(destinationPath);
+                    if (copiedInfo.Length != entry.StorageSize)
+                        throw new IOException(
+                            $"copied {copiedInfo.Length} bytes but the manifest reports {entry.StorageSize}");
 
-                copiedCount++;
-                copiedBytes += entry.StorageSize;
+                    copiedCount++;
+                    copiedBytes += entry.StorageSize;
+                }
+                catch (Exception ex)
+                {
+                    Logger.Warn(
+                        $"Failed to carry forward {key} from the previous backup: {ex.Message}. " +
+                        "This folder will be re-enumerated on the next run.");
+                    failedFolders.Add(manifestPath);
+                }
             }
-            catch (Exception ex)
-            {
-                Logger.Warn(
-                    $"Failed to carry forward {key} from the previous backup: {ex.Message}. " +
-                    "This folder will be re-enumerated on the next run.");
-                failedFolders.Add(manifestPath);
-            }
-        }
 
         Logger.Info($"=> Carried forward {copiedCount} file(s) ({FormatBytes(copiedBytes)}) without contacting Autodesk");
         if (failedFolders.Count > 0)
@@ -717,6 +717,15 @@ public class Backup : IBackup
             .Select(p => p.ProjectId)
             .ToHashSet(StringComparer.Ordinal);
 
+        // Directories inside an unwalked subtree are unknown territory: nothing under a pruned
+        // folder, or under a project that failed to enumerate, may be removed.
+        var protectedDirectoryPrefixes = new HashSet<string>(protectedPrefixes, StringComparer.OrdinalIgnoreCase);
+        foreach (var projectId in protectedProjectIds)
+        {
+            if (_projectPathPrefixes.TryGetValue(projectId, out var failedPrefix))
+                protectedDirectoryPrefixes.Add(failedPrefix);
+        }
+
         if (protectedPrefixes.Count > 0)
             Logger.Debug($"Excluding {protectedPrefixes.Count} pruned folder(s) from obsolete-file cleanup");
         if (protectedProjectIds.Count > 0)
@@ -740,7 +749,7 @@ public class Backup : IBackup
         }
 
         // Delete obsolete files
-        var deletedCount = 0;
+        var deletedPaths = new List<string>();
         foreach (var relativePath in filesToDelete)
         {
             var fullPath = Path.Combine(Config.BackupDirectory, relativePath.Replace('/', Path.DirectorySeparatorChar));
@@ -749,7 +758,7 @@ public class Backup : IBackup
                 try
                 {
                     File.Delete(fullPath);
-                    deletedCount++;
+                    deletedPaths.Add(relativePath);
                     Logger.Info($"[DELETED] Removed obsolete file: {relativePath}");
                 }
                 catch (Exception ex)
@@ -759,48 +768,92 @@ public class Backup : IBackup
             }
         }
 
-        if (deletedCount > 0)
+        if (deletedPaths.Count > 0)
         {
-            Logger.Info($"=> Removed {deletedCount} obsolete file(s)");
-            // Clean up empty directories after file deletion
-            CleanupEmptyDirectories(Config.BackupDirectory);
+            Logger.Info($"=> Removed {deletedPaths.Count} obsolete file(s)");
+            // Only the directories this run emptied are candidates, and only when ACC no longer
+            // lists them. A folder that still exists in the cloud stays on disk even when empty.
+            RemoveDirectoriesLeftEmpty(deletedPaths, GetLiveFolderPaths(projects), protectedDirectoryPrefixes);
         }
 
         return Task.CompletedTask;
     }
 
-    private void CleanupEmptyDirectories(string path)
+    /// <summary>
+    /// Manifest-relative paths of every directory this run still expects on disk: each project's own
+    /// directory plus every folder ACC reported for it, empty ones included. A project whose
+    /// enumeration failed contributes only its project directory -- its tree is unknown.
+    /// </summary>
+    private HashSet<string> GetLiveFolderPaths(List<ProjectBackup> projects)
     {
-        try
+        var live = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var project in projects)
         {
-            // Don't delete the root backup directory itself
-            if (path.Equals(Config.BackupDirectory, StringComparison.OrdinalIgnoreCase))
+            if (!_projectPathPrefixes.TryGetValue(project.ProjectId, out var prefix)) continue;
+            live.Add(prefix);
+            if (project.EnumerationFailed || project.RootFolder is null) continue;
+
+            foreach (var folder in new[] { project.RootFolder }.Concat(project.SubfoldersRecursive))
+                live.Add($"{prefix}/{folder.GetPath()[1..]}".Replace('\\', '/'));
+        }
+
+        return live;
+    }
+
+    /// <summary>
+    /// Walks up from each directory that lost a file in this run, removing those ACC no longer has.
+    /// Stops climbing at the first directory that is non-empty, still exists in the cloud, or sits
+    /// inside a subtree this run did not enumerate.
+    /// </summary>
+    private void RemoveDirectoriesLeftEmpty(IEnumerable<string> deletedRelativePaths,
+        ICollection<string> liveFolderPaths, ICollection<string> protectedPrefixes)
+    {
+        var candidates = deletedRelativePaths
+            .Select(GetParentPath)
+            .Where(path => path.Length > 0)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        var removedCount = 0;
+        foreach (var candidate in candidates)
+        {
+            var relativePath = candidate;
+            while (relativePath.Length > 0)
             {
-                // Just clean subdirectories
-                foreach (var directory in Directory.GetDirectories(path))
+                if (liveFolderPaths.Contains(relativePath)) break;
+                if (protectedPrefixes.Contains(relativePath)) break;
+                if (BackupManifest.IsUnderAnyFolder(relativePath, protectedPrefixes)) break;
+
+                var fullPath = Path.Combine(Config.BackupDirectory,
+                    relativePath.Replace('/', Path.DirectorySeparatorChar));
+                if (Directory.Exists(fullPath))
                 {
-                    CleanupEmptyDirectories(directory);
+                    if (Directory.EnumerateFileSystemEntries(fullPath).Any()) break;
+
+                    try
+                    {
+                        Directory.Delete(fullPath);
+                        removedCount++;
+                        Logger.Info($"[DELETED] Removed empty directory: {relativePath}");
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.Warn($"Failed to remove empty directory {fullPath}: {ex.Message}");
+                        break;
+                    }
                 }
-                return;
-            }
 
-            // Recursively clean subdirectories first
-            foreach (var directory in Directory.GetDirectories(path))
-            {
-                CleanupEmptyDirectories(directory);
-            }
-
-            // If this directory is now empty, delete it
-            if (!Directory.EnumerateFileSystemEntries(path).Any())
-            {
-                Directory.Delete(path);
-                Logger.Debug($"[DELETED] Removed empty directory: {Path.GetRelativePath(Config.BackupDirectory, path)}");
+                // A directory another candidate already removed still leaves its parent worth checking.
+                relativePath = GetParentPath(relativePath);
             }
         }
-        catch (Exception ex)
-        {
-            Logger.Debug($"Failed to cleanup directory {path}: {ex.Message}");
-        }
+
+        if (removedCount > 0) Logger.Info($"=> Removed {removedCount} empty directory(ies)");
+    }
+
+    private static string GetParentPath(string relativePath)
+    {
+        var index = relativePath.LastIndexOf('/');
+        return index <= 0 ? string.Empty : relativePath[..index];
     }
 
 
