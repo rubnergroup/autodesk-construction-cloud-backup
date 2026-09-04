@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections;
 using System.Net;
 using System.Net.Http;
@@ -294,5 +294,80 @@ public class RetryPolicyTests
         
         // Verify no retry logging occurred
         mockLogger.DidNotReceive().Warn(Arg.Any<Exception>(), Arg.Any<string>());
+    }
+
+    [Theory]
+    [InlineData(HttpStatusCode.Conflict)]
+    [InlineData(HttpStatusCode.NotFound)]
+    [InlineData(HttpStatusCode.BadRequest)]
+    public async Task RetryPolicy_WithNonTransientClientError_ShouldNotRetry(HttpStatusCode statusCode)
+    {
+        // Arrange
+        var config = new ApiClientConfiguration("testClientId", "testSecret", "testAccountId");
+        var mockLogger = Substitute.For<ILogger>();
+        config.Logger = mockLogger;
+
+        var retryPolicy = config.GetRetryPolicy(3, 2);
+
+        var attempt = 0;
+
+        // e.g. 409 "The user already belongs to the project": the answer will not change on retry.
+        var exception = new HttpRequestException(statusCode.ToString(), null, statusCode);
+
+        // Act
+        Exception caughtException = null;
+        try
+        {
+            await retryPolicy.ExecuteAsync(async () =>
+            {
+                attempt++;
+                throw exception;
+            });
+        }
+        catch (Exception ex)
+        {
+            caughtException = ex;
+        }
+
+        // Assert
+        attempt.Should().Be(1); // Only initial attempt, no retries
+        caughtException.Should().BeOfType<HttpRequestException>();
+        ((HttpRequestException)caughtException).StatusCode.Should().Be(statusCode);
+
+        // Verify no retry logging occurred
+        mockLogger.DidNotReceive().Warn(Arg.Any<Exception>(), Arg.Any<string>());
+    }
+
+    [Fact]
+    public async Task RetryPolicy_WithUnauthorized_ShouldRetryToRefreshTheToken()
+    {
+        // Arrange
+        var config = new ApiClientConfiguration("testClientId", "testSecret", "testAccountId");
+        config.Logger = Substitute.For<ILogger>();
+
+        // 0 second base delay so the test does not actually wait out the backoff.
+        var retryPolicy = config.GetRetryPolicy(2, 0);
+
+        var attempt = 0;
+
+        // 401 clears the cached access token, so the next attempt re-authenticates.
+        var exception = new HttpRequestException("Unauthorized", null, HttpStatusCode.Unauthorized);
+
+        // Act
+        try
+        {
+            await retryPolicy.ExecuteAsync(async () =>
+            {
+                attempt++;
+                throw exception;
+            });
+        }
+        catch (HttpRequestException)
+        {
+            // expected after the retries are exhausted
+        }
+
+        // Assert
+        attempt.Should().Be(3); // Initial attempt plus 2 retries
     }
 }

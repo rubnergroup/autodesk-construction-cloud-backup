@@ -22,8 +22,7 @@ public class ApiClientConfiguration : ApiClientOptions
     public AsyncRetryPolicy GetRetryPolicy(int maxRetryAttempts, int initialRetryDelayInSeconds)
     {
         return Policy
-            .Handle<Exception>(ex =>
-                ex is not HttpRequestException httpEx || httpEx.StatusCode != HttpStatusCode.Forbidden)
+            .Handle<Exception>(IsTransient)
             .WaitAndRetryAsync(
                 retryCount: maxRetryAttempts,
                 sleepDurationProvider: (retryAttempt, exception, context) =>
@@ -89,5 +88,21 @@ public class ApiClientConfiguration : ApiClientOptions
                     Logger?.Warn(exception, message);
                     await Task.CompletedTask;
                 });
+    }
+
+    // Only transient failures are worth retrying. A 4xx answer (403 Forbidden, 404 Not Found,
+    // 409 Conflict, ...) describes the request itself and will say the same thing on every
+    // attempt, so retrying it only burns the backoff budget before failing anyway.
+    // 401 stays retryable: HandleUnsuccessfulStatusCode clears the cached token on the way out,
+    // so the next attempt re-authenticates.
+    private static bool IsTransient(Exception exception)
+    {
+        if (exception is not HttpRequestException httpEx) return true;
+        // No status code means the request never got an answer (DNS, socket, TLS, timeout).
+        if (httpEx.StatusCode is null) return true;
+        return (int)httpEx.StatusCode >= 500 ||
+               httpEx.StatusCode is HttpStatusCode.Unauthorized
+                   or HttpStatusCode.RequestTimeout
+                   or HttpStatusCode.TooManyRequests;
     }
 }

@@ -1,4 +1,5 @@
-﻿using System.Text;
+﻿using System.Net;
+using System.Text;
 using Newtonsoft.Json;
 
 namespace ACC.ApiClient;
@@ -86,7 +87,8 @@ public partial class ApiClient
         return users.FirstOrDefault(u => string.Equals(u.Email, email, StringComparison.OrdinalIgnoreCase));
     }
 
-    public async Task AddProjectUser(string projectId, string email, string productKey, string productAccess)
+    // Returns true when the user was added, false when they were already a member of the project.
+    public async Task<bool> AddProjectUser(string projectId, string email, string productKey, string productAccess)
     {
         Config.Logger?.Trace("Top");
         var endpoint = $"{AdminApiBase}/v1/projects/{StripProjectIdPrefix(projectId)}/users";
@@ -95,6 +97,7 @@ public partial class ApiClient
             email,
             products = new[] { new { key = productKey, access = productAccess } }
         });
+        var alreadyMember = false;
         await Config.RetryPolicy.ExecuteAsync(async () =>
         {
             await EnsureAccessToken();
@@ -103,9 +106,20 @@ public partial class ApiClient
             request.Content = new StringContent(payload, Encoding.UTF8, "application/json");
             var response = await Config.HttpClient.SendAsync(request);
             var responseString = await response.Content.ReadAsStringAsync();
+            // The Admin API answers 409 Conflict when the user already belongs to the project.
+            // That is the state we asked for, so treat it as success rather than an error to
+            // throw on -- otherwise the retry policy would back off and retry a permanent answer.
+            if (response.StatusCode == HttpStatusCode.Conflict)
+            {
+                Config.Logger?.Debug($"{email} already belongs to project {projectId}: {responseString}");
+                alreadyMember = true;
+                return;
+            }
+
             HandleUnsuccessfulStatusCode(responseString, response, AdminMoreDetailsUrl);
         });
-        Config.Logger?.Debug($"Added {email} to project {projectId}");
+        if (!alreadyMember) Config.Logger?.Debug($"Added {email} to project {projectId}");
+        return !alreadyMember;
     }
 
     public async Task RemoveProjectUser(string projectId, string projectUserId)
