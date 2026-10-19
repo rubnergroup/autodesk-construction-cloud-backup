@@ -87,16 +87,24 @@ public partial class ApiClient
         return users.FirstOrDefault(u => string.Equals(u.Email, email, StringComparison.OrdinalIgnoreCase));
     }
 
-    // Returns true when the user was added, false when they were already a member of the project.
-    public async Task<bool> AddProjectUser(string projectId, string email, string productKey, string productAccess)
+    // In ACC the "Project Administrator" role is the projectAdministration product, not an access level on
+    // another product. Granting e.g. docs:administrator alone leaves the user listed as a project member,
+    // so asking for administrator access also grants projectAdministration:administrator.
+    private static object[] BuildProducts(string productKey, string productAccess)
+    {
+        var products = new List<object> { new { key = productKey, access = productAccess } };
+        if (productAccess == "administrator" && productKey != "projectAdministration")
+            products.Add(new { key = "projectAdministration", access = "administrator" });
+        return products.ToArray();
+    }
+
+    public async Task<AddProjectUserResult> AddProjectUser(string projectId, string email, string productKey,
+        string productAccess)
     {
         Config.Logger?.Trace("Top");
         var endpoint = $"{AdminApiBase}/v1/projects/{StripProjectIdPrefix(projectId)}/users";
-        var payload = JsonConvert.SerializeObject(new
-        {
-            email,
-            products = new[] { new { key = productKey, access = productAccess } }
-        });
+        var products = BuildProducts(productKey, productAccess);
+        var payload = JsonConvert.SerializeObject(new { email, products });
         var alreadyMember = false;
         await Config.RetryPolicy.ExecuteAsync(async () =>
         {
@@ -118,8 +126,39 @@ public partial class ApiClient
 
             HandleUnsuccessfulStatusCode(responseString, response, AdminMoreDetailsUrl);
         });
-        if (!alreadyMember) Config.Logger?.Debug($"Added {email} to project {projectId}");
-        return !alreadyMember;
+        if (!alreadyMember)
+        {
+            Config.Logger?.Debug($"Added {email} to project {projectId}");
+            return AddProjectUserResult.Added;
+        }
+
+        // An existing member keeps their old access unless we patch it. Only do that when elevating:
+        // patching member access onto an existing admin would demote them.
+        if (productAccess != "administrator") return AddProjectUserResult.AlreadyMember;
+        var existing = await GetProjectUserByEmail(projectId, email)
+                       ?? throw new InvalidOperationException(
+                           $"{email} is reported as a member of project {projectId} but was not found in its user list");
+        await UpdateProjectUserProducts(projectId, existing.Id, products);
+        return AddProjectUserResult.AccessUpdated;
+    }
+
+    // PATCH construction/admin/v1/projects/{projectId}/users/{userId}
+    private async Task UpdateProjectUserProducts(string projectId, string projectUserId, object[] products)
+    {
+        Config.Logger?.Trace("Top");
+        var endpoint = $"{AdminApiBase}/v1/projects/{StripProjectIdPrefix(projectId)}/users/{projectUserId}";
+        var payload = JsonConvert.SerializeObject(new { products });
+        await Config.RetryPolicy.ExecuteAsync(async () =>
+        {
+            await EnsureAccessToken();
+            using var request = new HttpRequestMessage(HttpMethod.Patch, endpoint);
+            AddUserIdHeader(request);
+            request.Content = new StringContent(payload, Encoding.UTF8, "application/json");
+            var response = await Config.HttpClient.SendAsync(request);
+            var responseString = await response.Content.ReadAsStringAsync();
+            HandleUnsuccessfulStatusCode(responseString, response, AdminMoreDetailsUrl);
+        });
+        Config.Logger?.Debug($"Updated products of user {projectUserId} on project {projectId}");
     }
 
     public async Task RemoveProjectUser(string projectId, string projectUserId)
@@ -146,6 +185,13 @@ public partial class ApiClient
                 "Pass --adminemail or --adminuserid.");
         request.Headers.Add("User-Id", AdminUserId);
     }
+}
+
+public enum AddProjectUserResult
+{
+    Added,
+    AlreadyMember,
+    AccessUpdated
 }
 
 public class AccountUser

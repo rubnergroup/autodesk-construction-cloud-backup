@@ -86,12 +86,17 @@ foreach (var project in projects)
         }
         else
         {
-            var added = options.DryRun ||
-                        await apiClient.AddProjectUser(project.ProjectId, options.UserEmail, options.ProductKey,
-                            options.ProductAccess);
-            logger.Info(added
-                ? $"[ok] {project.Name}: added {options.UserEmail}"
-                : $"[skip] {project.Name}: {options.UserEmail} is already a member");
+            var result = options.DryRun
+                ? AddProjectUserResult.Added
+                : await apiClient.AddProjectUser(project.ProjectId, options.UserEmail, options.ProductKey,
+                    options.ProductAccess);
+            logger.Info(result switch
+            {
+                AddProjectUserResult.Added => $"[ok] {project.Name}: added {options.UserEmail}",
+                AddProjectUserResult.AccessUpdated =>
+                    $"[ok] {project.Name}: {options.UserEmail} was already a member, set access to {options.ProductAccess}",
+                _ => $"[skip] {project.Name}: {options.UserEmail} is already a member"
+            });
         }
 
         succeeded++;
