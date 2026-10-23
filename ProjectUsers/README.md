@@ -58,6 +58,13 @@ ACCProjectUsers --clientid <id> --clientsecret <secret> --accountid <accountId> 
     --user new.person@example.com --adminemail admin@example.com
 ```
 
+Grant several products at once, e.g. Docs, Build and Insight:
+
+```
+ACCProjectUsers --clientid <id> --clientsecret <secret> --accountid <accountId> \
+    --user new.person@example.com --adminemail admin@example.com --product docs,build,insight
+```
+
 Remove the user from every project instead:
 
 ```
@@ -77,11 +84,13 @@ ACCProjectUsers --clientid <id> --clientsecret <secret> --accountid <accountId> 
 | `--remove`        | `false`  | Remove the user instead of adding them                                     |
 | `--adminemail`    |          | Email of the account admin to act as. Required for writes unless `--adminuserid` is given |
 | `--adminuserid`   |          | BIM 360 user id of the account admin to act as                             |
-| `--product`       | `docs`   | Product key to grant when adding, e.g. `docs`, `projectAdministration`, `build` |
-| `--access`        | `member` | Access level to grant when adding: `member` or `administrator`. `administrator` also grants `projectAdministration`, making the user a project admin, and upgrades users who are already members |
+| `--product`       | `docs`   | Comma-separated product keys to grant when adding, e.g. `docs,build,insight`. Append `:member` or `:administrator` to set one product's access, e.g. `docs,build:administrator` |
+| `--access`        | `member` | Default access level for each `--product`: `member` or `administrator`. Administrator access on any product also grants `projectAdministration`, making the user a project admin |
 | `-n`, `--number`  | `0`      | Only act on the first N projects. `0` means all projects                   |
 | `--dryrun`        | `false`  | Log what would happen without calling the add/remove endpoints             |
 | `--debuglogging`  | `false`  | Enable debug logging                                                       |
 
-The tool skips projects where the user is already a member (when adding with `--access member`) or not a member (when removing). It exits with
+If the user is already a member of a project, the tool grants the requested products they don't have yet, or have at a
+lower access level. It never lowers existing access, so an existing administrator stays one. It skips projects where the
+user already has all requested products (when adding) or is not a member (when removing). It exits with
 code `1` if any project failed.

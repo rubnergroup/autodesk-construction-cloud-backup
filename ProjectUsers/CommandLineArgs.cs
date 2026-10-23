@@ -36,12 +36,13 @@ public class CommandLineArgs
         HelpText = "BIM 360 user id of an account admin, sent as the User-Id header. Alternative to --adminemail.")]
     public string? AdminUserId { get; set; }
 
-    [Option("product", Required = false, Default = "docs",
-        HelpText = "Product key to grant when adding, e.g. docs, projectAdministration, build.")]
-    public string ProductKey { get; set; } = "docs";
+    [Option("product", Required = false, Separator = ',', Default = new[] { "docs" },
+        HelpText = "Comma-separated product keys to grant when adding, e.g. docs,build,insight. " +
+                   "Append :member or :administrator to override --access for one product, e.g. docs,build:administrator.")]
+    public IEnumerable<string> Products { get; set; } = ["docs"];
 
     [Option("access", Required = false, Default = "member",
-        HelpText = "Product access level to grant when adding: member or administrator.")]
+        HelpText = "Default access level for each --product when adding: member or administrator.")]
     public string ProductAccess { get; set; } = "member";
 
     [Option("dryrun", Required = false, Default = false,

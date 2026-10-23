@@ -60,12 +60,33 @@ if (string.IsNullOrWhiteSpace(apiClient.AdminUserId) && !options.DryRun)
     return 1;
 }
 
+var products = new List<ProjectUserProduct>();
+foreach (var entry in options.Products.Select(p => p.Trim()).Where(p => p.Length > 0))
+{
+    var parts = entry.Split(':', 2);
+    var access = parts.Length == 2 ? parts[1] : options.ProductAccess;
+    if (access is not ("member" or "administrator"))
+    {
+        logger.Error($"Invalid access level '{access}' for product '{parts[0]}': use member or administrator");
+        return 1;
+    }
+
+    products.Add(new ProjectUserProduct { Key = parts[0], Access = access });
+}
+
+if (!options.Remove && products.Count == 0)
+{
+    logger.Error("--product needs at least one product key");
+    return 1;
+}
+
 var projects = await apiClient.GetProjects();
 if (options.NumberOfProjects > 0) projects = projects.Take(options.NumberOfProjects).ToList();
 
 var action = options.Remove ? "Removing" : "Adding";
 var direction = options.Remove ? "from" : "to";
-logger.Info($"=> {action} {options.UserEmail} {direction} {projects.Count} project(s){(options.DryRun ? " (dry run)" : "")}");
+logger.Info($"=> {action} {options.UserEmail} {direction} {projects.Count} project(s)" +
+            $"{(options.Remove ? "" : $" with {string.Join(", ", products)}")}{(options.DryRun ? " (dry run)" : "")}");
 
 var succeeded = 0;
 var failed = 0;
@@ -88,14 +109,13 @@ foreach (var project in projects)
         {
             var result = options.DryRun
                 ? AddProjectUserResult.Added
-                : await apiClient.AddProjectUser(project.ProjectId, options.UserEmail, options.ProductKey,
-                    options.ProductAccess);
+                : await apiClient.AddProjectUser(project.ProjectId, options.UserEmail, products);
             logger.Info(result switch
             {
                 AddProjectUserResult.Added => $"[ok] {project.Name}: added {options.UserEmail}",
                 AddProjectUserResult.AccessUpdated =>
-                    $"[ok] {project.Name}: {options.UserEmail} was already a member, set access to {options.ProductAccess}",
-                _ => $"[skip] {project.Name}: {options.UserEmail} is already a member"
+                    $"[ok] {project.Name}: {options.UserEmail} was already a member, granted missing products",
+                _ => $"[skip] {project.Name}: {options.UserEmail} is already a member with these products"
             });
         }
 

@@ -89,21 +89,36 @@ public partial class ApiClient
 
     // In ACC the "Project Administrator" role is the projectAdministration product, not an access level on
     // another product. Granting e.g. docs:administrator alone leaves the user listed as a project member,
-    // so asking for administrator access also grants projectAdministration:administrator.
-    private static object[] BuildProducts(string productKey, string productAccess)
+    // so asking for administrator access on any product also grants projectAdministration:administrator.
+    private static List<ProjectUserProduct> BuildProducts(IEnumerable<ProjectUserProduct> requested)
     {
-        var products = new List<object> { new { key = productKey, access = productAccess } };
-        if (productAccess == "administrator" && productKey != "projectAdministration")
-            products.Add(new { key = "projectAdministration", access = "administrator" });
-        return products.ToArray();
+        // Later entries for the same key win, so "docs,docs:administrator" grants administrator.
+        var products = requested
+            .GroupBy(p => p.Key, StringComparer.OrdinalIgnoreCase)
+            .Select(g => g.Last())
+            .ToList();
+        if (products.Any(p => p.Access == "administrator") &&
+            !products.Any(p => p.Key == "projectAdministration"))
+            products.Add(new ProjectUserProduct { Key = "projectAdministration", Access = "administrator" });
+        return products;
     }
 
-    public async Task<AddProjectUserResult> AddProjectUser(string projectId, string email, string productKey,
-        string productAccess)
+    private static int AccessRank(string? access)
+    {
+        return access switch
+        {
+            "administrator" => 2,
+            "member" => 1,
+            _ => 0
+        };
+    }
+
+    public async Task<AddProjectUserResult> AddProjectUser(string projectId, string email,
+        IEnumerable<ProjectUserProduct> requestedProducts)
     {
         Config.Logger?.Trace("Top");
         var endpoint = $"{AdminApiBase}/v1/projects/{StripProjectIdPrefix(projectId)}/users";
-        var products = BuildProducts(productKey, productAccess);
+        var products = BuildProducts(requestedProducts);
         var payload = JsonConvert.SerializeObject(new { email, products });
         var alreadyMember = false;
         await Config.RetryPolicy.ExecuteAsync(async () =>
@@ -132,18 +147,23 @@ public partial class ApiClient
             return AddProjectUserResult.Added;
         }
 
-        // An existing member keeps their old access unless we patch it. Only do that when elevating:
-        // patching member access onto an existing admin would demote them.
-        if (productAccess != "administrator") return AddProjectUserResult.AlreadyMember;
+        // An existing member keeps their old products unless we patch them. Only patch products the user
+        // lacks or holds at a lower level: patching member access onto an existing admin would demote them.
         var existing = await GetProjectUserByEmail(projectId, email)
                        ?? throw new InvalidOperationException(
                            $"{email} is reported as a member of project {projectId} but was not found in its user list");
-        await UpdateProjectUserProducts(projectId, existing.Id, products);
+        var missing = products
+            .Where(p => AccessRank(p.Access) > AccessRank(existing.Products?
+                .FirstOrDefault(e => string.Equals(e.Key, p.Key, StringComparison.OrdinalIgnoreCase))?.Access))
+            .ToList();
+        if (missing.Count == 0) return AddProjectUserResult.AlreadyMember;
+        await UpdateProjectUserProducts(projectId, existing.Id, missing);
         return AddProjectUserResult.AccessUpdated;
     }
 
     // PATCH construction/admin/v1/projects/{projectId}/users/{userId}
-    private async Task UpdateProjectUserProducts(string projectId, string projectUserId, object[] products)
+    private async Task UpdateProjectUserProducts(string projectId, string projectUserId,
+        List<ProjectUserProduct> products)
     {
         Config.Logger?.Trace("Top");
         var endpoint = $"{AdminApiBase}/v1/projects/{StripProjectIdPrefix(projectId)}/users/{projectUserId}";
@@ -224,4 +244,19 @@ public class ProjectUser
     [JsonProperty("name")] public string? Name { get; set; }
 
     [JsonProperty("autodeskId")] public string? AutodeskId { get; set; }
+
+    [JsonProperty("products")] public List<ProjectUserProduct>? Products { get; set; }
+}
+
+// A product (e.g. docs, build, insight) and the access level on it: administrator, member or none.
+public class ProjectUserProduct
+{
+    [JsonProperty("key")] public string Key { get; set; } = string.Empty;
+
+    [JsonProperty("access")] public string Access { get; set; } = "member";
+
+    public override string ToString()
+    {
+        return $"{Key}:{Access}";
+    }
 }
