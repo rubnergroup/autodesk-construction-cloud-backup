@@ -21,5 +21,10 @@
         <ProjectReference Include="..\ApiClient\ApiClient.csproj"/>
         <ProjectReference Include="..\Library.Logger\Library.Logger.csproj"/>
     </ItemGroup>
+    <PropertyGroup Condition="'$(Configuration)'=='Release'">
+        <SelfContained>true</SelfContained>
+        <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+        <PublishSingleFile>false</PublishSingleFile>
+    </PropertyGroup>
 
 </Project>
